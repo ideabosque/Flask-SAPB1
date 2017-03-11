@@ -1,4 +1,4 @@
-from flask import current_app
+from flask import current_app, g
 import pymssql
 import datetime
 from time import time
@@ -10,25 +10,38 @@ except ImportError:
     from flask import _request_ctx_stack as stack
 
 
-class Adaptor(object):
-    """Adaptor contains SAP B1 COM object and MS SQL cursor object.
+class SAPB1COMAdaptor(object):
+    """Adaptor contains SAP B1 COM object.
     """
-
-    def __init__(self, company=None, sqlSrvConn=None):
+    def __init__(self, company=None):
         self._company = company
-        self._sqlSrvConn = sqlSrvConn
-        self._sqlSrvCursor = self._sqlSrvConn.cursor(as_dict=True)
 
     def __del__(self):
         if self._company:
             self._company.Disconnect()
-        self._sqlSrvConn.close()
 
     @property
     def company(self):
         """SAPB1 COM object.
         """
         return self._company
+
+    def disconnect(self):
+        self._company.Disconnect()
+        log = "Close SAPB1 connection for " + self._company.CompanyName
+        current_app.logger.info(log)
+
+
+
+class MSSQLCursorAdaptor(object):
+    """MS SQL cursor object.
+    """
+    def __init__(self, sqlSrvConn=None):
+        self._sqlSrvConn = sqlSrvConn
+        self._sqlSrvCursor = self._sqlSrvConn.cursor(as_dict=True)
+
+    def __del__(self):
+        self._sqlSrvConn.close()
 
     @property
     def sqlSrvCursor(self):
@@ -37,8 +50,10 @@ class Adaptor(object):
         return self._sqlSrvCursor
 
     def disconnect(self):
-        self._company.Disconnect()
         self._sqlSrvConn.close()
+        log = "Close SAPB1 DB connection"
+        current_app.logger.info(log)
+
 
 
 class SAPB1Adaptor(object):
@@ -59,42 +74,48 @@ class SAPB1Adaptor(object):
         else:
             app.teardown_request(self.teardown)
 
-    def connect(self):
+    def connect(self, type=None):
         """Initiate the connect with SAP B1 and MS SQL server.
         """
-        SAPbobsCOM = __import__(current_app.config['DIAPI'], globals(), locals(), [], -1)
-        self.constants = getattr(SAPbobsCOM, "constants")
-        Company = getattr(SAPbobsCOM, "Company")
-        company = Company()
-        company.Server = current_app.config['SERVER']
-        company.UseTrusted = False
-        company.language = eval("self.constants." + current_app.config['LANGUAGE'])
-        company.DbServerType = eval("self.constants." + current_app.config['DBSERVERTYPE'])
-        company.CompanyDB = current_app.config['COMPANYDB']
-        company.UserName = current_app.config['B1USERNAME']
-        company.Password = current_app.config['B1PASSWORD']
-        company.Connect()
-        log = "Open SAPB1 connection for " + company.CompanyName
-        current_app.logger.info(log)
-
-        sqlSrvConn = pymssql.connect(current_app.config['SERVER'],
-                                    current_app.config['DBUSERNAME'],
-                                    current_app.config['DBPASSWORD'],
-                                    current_app.config['COMPANYDB'])
-        log = "Open SAPB1 DB connection"
-        current_app.logger.info(log)
-        return Adaptor(company, sqlSrvConn)
+        if type == "COM":
+            SAPbobsCOM = __import__(current_app.config['DIAPI'], globals(), locals(), [], -1)
+            self.constants = getattr(SAPbobsCOM, "constants")
+            Company = getattr(SAPbobsCOM, "Company")
+            company = Company()
+            company.Server = current_app.config['SERVER']
+            company.UseTrusted = False
+            company.language = eval("self.constants." + current_app.config['LANGUAGE'])
+            company.DbServerType = eval("self.constants." + current_app.config['DBSERVERTYPE'])
+            company.CompanyDB = current_app.config['COMPANYDB']
+            company.UserName = current_app.config['B1USERNAME']
+            company.Password = current_app.config['B1PASSWORD']
+            company.Connect()
+            log = "Open SAPB1 connection for " + company.CompanyName
+            current_app.logger.info(log)
+            return SAPB1COMAdaptor(company=company)
+        elif type == "CURSOR":
+            sqlSrvConn = pymssql.connect(current_app.config['SERVER'],
+                                        current_app.config['DBUSERNAME'],
+                                        current_app.config['DBPASSWORD'],
+                                        current_app.config['COMPANYDB'])
+            log = "Open SAPB1 DB connection"
+            current_app.logger.info(log)
+            return MSSQLCursorAdaptor(sqlSrvConn=sqlSrvConn)
+        else:
+            return None
 
     def teardown(self, exception):
         ctx = stack.top
-        if hasattr(ctx, 'sapb1adaptor'):
-            ctx.sapb1adaptor.disconnect()
+        if hasattr(ctx, 'sapb1COMAdaptor'):
+            ctx.sapb1COMAdaptor.disconnect()
+        if hasattr(ctx, 'msSQLCursorAdaptor'):
+            ctx.msSQLCursorAdaptor.disconnect()
 
     def info(self):
         """Show the information for the SAP B1 connection.
         """
         data = {
-            'company_name': self.adaptor.company.CompanyName,
+            'company_name': self.comAdaptor.company.CompanyName,
             'diapi': current_app.config['DIAPI'],
             'server': current_app.config['SERVER'],
             'company_db': current_app.config['COMPANYDB']
@@ -102,12 +123,20 @@ class SAPB1Adaptor(object):
         return data
 
     @property
-    def adaptor(self):
+    def comAdaptor(self):
         ctx = stack.top
         if ctx is not None:
-            if not hasattr(ctx, 'sapb1adaptor'):
-                ctx.sapb1adaptor = self.connect()
-            return ctx.sapb1adaptor
+            if not hasattr(ctx, 'sapb1COMAdaptor'):
+                ctx.sapb1COMAdaptor = self.connect(type="COM")
+            return ctx.sapb1COMAdaptor
+
+    @property
+    def cursorAdaptor(self):
+        ctx = stack.top
+        if ctx is not None:
+            if not hasattr(ctx, 'msSQLCursorAdaptor'):
+                ctx.msSQLCursorAdaptor = self.connect(type="CURSOR")
+            return ctx.msSQLCursorAdaptor
 
     def trimValue(self, value, maxLength):
         """Trim the value.
@@ -126,9 +155,9 @@ class SAPB1Adaptor(object):
         sql = """SELECT top {0} {1} FROM dbo.ORDR""".format(num, cols)
         if len(params) > 0:
             sql = sql + ' WHERE ' + " AND ".join(["{0} {1} %({2})s".format(k, ops[k], k) for k in params.keys()])
-        self.adaptor.sqlSrvCursor.execute(sql, {key: params[key]['value'] for key in params.keys()})
+        self.cursorAdaptor.sqlSrvCursor.execute(sql, {key: params[key]['value'] for key in params.keys()})
         orders = []
-        for row in self.adaptor.sqlSrvCursor:
+        for row in self.cursorAdaptor.sqlSrvCursor:
             order = {}
             for k, v in row.items():
                 value = ''
@@ -140,12 +169,106 @@ class SAPB1Adaptor(object):
             orders.append(order)
         return orders
 
+
+    #
+    # # Retrieve the DocNum of the Invoice.
+    # def getInvoiceDocNum(self, id):
+    #     rs = self.company.GetBusinessObject(self.constants.BoRecordset)
+    #     sql = """SELECT DISTINCT t0.DocEntry
+    #             FROM dbo.OINV t0, dbo.INV1 t1
+    #             WHERE t0.DocEntry = t1.DocEntry
+    #             AND t1.BaseType = '%s'
+    #             AND t1.BaseEntry = '%s'""" % (self.constants.oDeliveryNotes, id)
+    #     rs.DoQuery(sql)
+    #     docNum = rs.Fields.Item(0).Value
+    #     return docNum
+    #
+    # # Retrieve the DocNum of the BusinessPartner.
+    # def getBusinessPartnerDocNum(self, id):
+    #     rs = self.company.GetBusinessObject(self.constants.BoRecordset)
+    #     sql = """SELECT distinct CardCode FROM OCRD WHERE CardFName = '%s'""" % id
+    #     rs.DoQuery(sql)
+    #     docNum = rs.Fields.Item(0).Value
+    #     return docNum
+    #
+    # # Retrieve the DocNum of the DownPayment.
+    # def getDownPaymentDocNum(self, id):
+    #     rs = self.company.GetBusinessObject(self.constants.BoRecordset)
+    #     sql = """SELECT DISTINCT t0.DocEntry
+    #             FROM dbo.ODPI t0, dbo.DPI1 t1
+    #             WHERE t0.DocEntry = t1.DocEntry
+    #             AND t1.BaseType = '%s'
+    #             AND t1.BaseEntry = '%s'""" % (self.constants.oOrders, id)
+    #     rs.DoQuery(sql)
+    #     docNum = rs.Fields.Item(0).Value
+    #     return docNum
+    #
+    # # Retrieve the DocNum of the DptInvoice.
+    # def getDptInvoiceDocNum(self, id):
+    #     rs = self.company.GetBusinessObject(self.constants.BoRecordset)
+    #     sql = """SELECT DocEntry FROM dbo.ODPI WHERE DpmAmnt != DpmAppl AND NumAtCard = '%s'""" % id
+    #     rs.DoQuery(sql)
+    #     docNum = rs.Fields.Item(0).Value
+    #     return docNum
+    #
+    # # Retrieve the DocNum of the BusinessPartnerByEmail.
+    # def getBusinessPartnerByEmailDocNum(self, id):
+    #     rs = self.company.GetBusinessObject(self.constants.BoRecordset)
+    #     sql = """SELECT DISTINCT OCRD.CardCode
+    #             FROM  OCRD
+    #             INNER JOIN OCPR ON OCRD.CntctPrsn = OCPR.Name AND OCRD.CardCode = OCPR.CardCode
+    #             where CardType = 'C'
+    #             AND ISNULL(OCRD.E_Mail, OCPR.E_MailL) = '%s'""" % (id)
+    #     rs.DoQuery(sql)
+    #     docNum = rs.Fields.Item(0).Value
+    #     return docNum
+    #
+    # # Retrieve the DocNum of the DptInvoice.
+    # def getBusinessPartnerByCodeDocNum(self, id):
+    #     rs = self.company.GetBusinessObject(self.constants.BoRecordset)
+    #     sql = """SELECT distinct CardCode FROM OCRD WHERE CardCode = '%s'""" % id
+    #     rs.DoQuery(sql)
+    #     docNum = rs.Fields.Item(0).Value
+    #     return docNum
+    #
+    # # Retrieve the DocNum by docType.
+    # def getDocNum(self, docType, id):
+    #     rs = self.company.GetBusinessObject(self.constants.BoRecordset)
+    #     sqls = {}
+    #     sqls['oOrders'] = """SELECT DocEntry FROM dbo.ORDR WHERE NumAtCard = '%s'""" % id
+    #     #sqls['oOrders'] = """SELECT DocEntry FROM dbo.ORDR WHERE U_MageOrderIncId = '%s'""" % id
+    #     sqls['oInvoices'] = """SELECT DISTINCT t0.DocEntry
+    #                             FROM dbo.OINV t0, dbo.INV1 t1
+    #                             WHERE t0.DocEntry = t1.DocEntry
+    #                             AND t1.BaseType = '%s'
+    #                             AND t1.BaseEntry = '%s'""" % (self.constants.oDeliveryNotes, id)
+    #     sqls['oBusinessPartners'] = """SELECT distinct CardCode FROM OCRD WHERE CardFName = '%s'""" % id
+    #     sqls['oDownPayments'] = """SELECT DISTINCT t0.DocEntry
+    #                                 FROM dbo.ODPI t0, dbo.DPI1 t1
+    #                                 WHERE t0.DocEntry = t1.DocEntry
+    #                                 AND t1.BaseType = '%s'
+    #                                 AND t1.BaseEntry = '%s'""" % (self.constants.oOrders, id)
+    #     sqls['dptInvoice'] = """SELECT DocEntry FROM dbo.ODPI WHERE DpmAmnt != DpmAppl AND NumAtCard = '%s'""" % id
+    #     sqls['oBusinessPartnersByEmail'] = """
+    #         SELECT DISTINCT OCRD.CardCode
+    #         FROM  OCRD
+    #         INNER JOIN OCPR ON OCRD.CntctPrsn = OCPR.Name AND OCRD.CardCode = OCPR.CardCode
+    #         where CardType = 'C'
+    #         AND ISNULL(OCRD.E_Mail, OCPR.E_MailL) = '%s'
+    #     """ % (id)
+    #     sqls['oBusinessPartnersByCode'] = """SELECT distinct CardCode FROM OCRD WHERE CardCode = '%s'""" % id
+    #     sql = sqls[docType]
+    #     rs.DoQuery(sql)
+    #     docNum = rs.Fields.Item(0).Value
+    #     return docNum
+
+
     def getMainCurrency(self):
         """Retrieve the main currency of the company from SAP B1.
         """
         sql = """SELECT MainCurncy FROM dbo.OADM"""
-        self.adaptor.sqlSrvCursor.execute(sql)
-        mainCurrency = self.adaptor.sqlSrvCursor.fetchone()['MainCurncy']
+        self.cursorAdaptor.sqlSrvCursor.execute(sql)
+        mainCurrency = self.cursorAdaptor.sqlSrvCursor.fetchone()['MainCurncy']
         return mainCurrency
 
     def getContacts(self, num=1, columns=[], cardCode=None, contact={}):
@@ -160,9 +283,9 @@ class SAPB1Adaptor(object):
         params['cardcode'] = cardCode
         sql = sql + ' WHERE ' + " AND ".join(["{0} = %({1})s".format(k, k) for k in params.keys()])
 
-        self.adaptor.sqlSrvCursor.execute(sql, params)
+        self.cursorAdaptor.sqlSrvCursor.execute(sql, params)
         contacts = []
-        for row in self.adaptor.sqlSrvCursor:
+        for row in self.cursorAdaptor.sqlSrvCursor:
             contact = {}
             for k, v in row.items():
                 value = ''
@@ -177,7 +300,7 @@ class SAPB1Adaptor(object):
     def insertContact(self, cardCode, contact):
         """Insert a new contact into a business partner by CardCode.
         """
-        busPartner = self.adaptor.company.GetBusinessObject(self.constants.oBusinessPartners)
+        busPartner = self.comAdaptor.company.GetBusinessObject(self.constants.oBusinessPartners)
         busPartner.GetByKey(cardCode)
         current = busPartner.ContactEmployees.Count
         if busPartner.ContactEmployees.InternalCode == 0:
@@ -238,17 +361,59 @@ class SAPB1Adaptor(object):
         """Retrieve expnsCode by expnsName.
         """
         sql = """SELECT ExpnsCode FROM dbo.OEXD WHERE ExpnsName = %s"""
-        self.adaptor.sqlSrvCursor.execute(sql, (expnsName))
-        expnsCode = self.adaptor.sqlSrvCursor.fetchone()['ExpnsCode']
+        self.cursorAdaptor.sqlSrvCursor.execute(sql, (expnsName))
+        expnsCode = self.cursorAdaptor.sqlSrvCursor.fetchone()['ExpnsCode']
         return expnsCode
 
     def getTrnspCode(self, trnspName):
         """Retrieve TrnspCode by trnspName.
         """
         sql = """SELECT TrnspCode FROM dbo.OSHP WHERE TrnspName = %s"""
-        self.adaptor.sqlSrvCursor.execute(sql, (trnspName))
-        trnspCode = self.adaptor.sqlSrvCursor.fetchone()['TrnspCode']
+        self.cursorAdaptor.sqlSrvCursor.execute(sql, (trnspName))
+        trnspCode = self.cursorAdaptor.sqlSrvCursor.fetchone()['TrnspCode']
         return trnspCode
+
+    def getExpnsNames(self):
+        """Retrieve expnsNames.
+        """
+        sql = """SELECT ExpnsName FROM dbo.OEXD"""
+        self.cursorAdaptor.sqlSrvCursor.execute(sql)
+        expnsNames = []
+        for row in self.cursorAdaptor.sqlSrvCursor:
+            for k, v in row.items():
+                expnsNames.append(v)
+        return expnsNames
+
+    def getTrnspNames(self):
+        """Retrieve TrnspNames.
+        """
+        sql = """SELECT TrnspName FROM dbo.OSHP"""
+        self.cursorAdaptor.sqlSrvCursor.execute(sql)
+        trnspNames = []
+        for row in self.cursorAdaptor.sqlSrvCursor:
+            for k, v in row.items():
+                trnspNames.append(v)
+        return trnspNames
+
+    def getPayMethCods(self):
+        sql = """SELECT PayMethCod from opym"""
+        self.cursorAdaptor.sqlSrvCursor.execute(sql)
+        payMethCods = []
+        for row in self.cursorAdaptor.sqlSrvCursor:
+            for k, v in row.items():
+                payMethCods.append(v)
+        return payMethCods
+
+    def getTaxCodes(self):
+        sql = """SELECT Code, Name, Rate from osta"""
+        self.cursorAdaptor.sqlSrvCursor.execute(sql)
+        taxCodes = []
+        for row in self.cursorAdaptor.sqlSrvCursor:
+            taxCode = {}
+            for k, v in row.items():
+                taxCode[k] = str(v)
+            taxCodes.append(taxCode)
+        return taxCodes
 
     def insertOrder(self, o):
         """Insert an order into SAP B1.
@@ -256,7 +421,7 @@ class SAPB1Adaptor(object):
         o["billto_telephone"] = self.trimValue(o["billto_telephone"],20)
         o['billto_address'] = self.trimValue(o['billto_address'],100)
         o['shipto_address'] = self.trimValue(o['shipto_address'],100)
-        order = self.adaptor.company.GetBusinessObject(self.constants.oOrders)
+        order = self.comAdaptor.company.GetBusinessObject(self.constants.oOrders)
         order.DocDueDate = o['doc_due_date']
         order.CardCode = o['card_code']
         name = o['billto_firstname'] + ' ' + o['billto_lastname']
@@ -286,19 +451,26 @@ class SAPB1Adaptor(object):
             order.NumAtCard = str(o['fe_order_id'])
 
         # Set bill to address properties
+        # order.AddressExtension.BillToBlock = "BillToBlockU"
+        # order.AddressExtension.BillToBuilding = "BillToBuildingU"
         order.AddressExtension.BillToCity = o['billto_city']
         order.AddressExtension.BillToCountry = o['billto_country']
         order.AddressExtension.BillToCounty = o['billto_country']
         order.AddressExtension.BillToState = o['billto_state']
         order.AddressExtension.BillToStreet = o['billto_address']
+        # order.AddressExtension.BillToStreetNo = "ShipToStreetNoU"
         order.AddressExtension.BillToZipCode = o['billto_zipcode']
+        # order.AddressExtension.BillToAddressType = "BillToAddressTypeU"
 
         # Set ship to address properties
+        # order.AddressExtension.ShipToBlock = "ShipToBlockU"
+        # order.AddressExtension.ShipToBuilding = "ShipToBuildingU"
         order.AddressExtension.ShipToCity = o['shipto_city']
         order.AddressExtension.ShipToCountry = o['shipto_country']
         order.AddressExtension.ShipToCounty = o['shipto_county']
         order.AddressExtension.ShipToState = o['shipto_state']
         order.AddressExtension.ShipToStreet = o['shipto_address']
+        # order.AddressExtension.ShipToStreetNo = "ShipToStreetNoU"
         order.AddressExtension.ShipToZipCode = o['shipto_zipcode']
 
         i = 0
@@ -314,7 +486,7 @@ class SAPB1Adaptor(object):
 
         lRetCode = order.Add()
         if lRetCode != 0:
-            error = str(self.adaptor.company.GetLastError())
+            error = str(self.comAdaptor.company.GetLastError())
             current_app.logger.error(error)
             raise Exception(error)
         else:
@@ -327,10 +499,10 @@ class SAPB1Adaptor(object):
             boOrderId = orders[0]['DocEntry']
             return boOrderId
 
-    def cancelOrder(self,o):
+    def cancelOrder(self, o):
         """Cancel an order in SAP B1.
         """
-        order = self.adaptor.company.GetBusinessObject(self.constants.oOrders)
+        order = self.comAdaptor.company.GetBusinessObject(self.constants.oOrders)
         params = None
         if 'fe_order_id_udf' in o.keys():
             params = {o['fe_order_id_udf']: {'value': str(o['fe_order_id'])}}
@@ -363,9 +535,9 @@ class SAPB1Adaptor(object):
         if len(params) > 0:
             sql = sql + ' WHERE ' + " AND ".join(["{0} = %({1})s".format(k, k) for k in params.keys()])
 
-        self.adaptor.sqlSrvCursor.execute(sql, params)
+        self.cursorAdaptor.sqlSrvCursor.execute(sql, params)
         items = []
-        for row in self.adaptor.sqlSrvCursor:
+        for row in self.cursorAdaptor.sqlSrvCursor:
             item = {}
             for k, v in row.items():
                 value = ''
@@ -389,9 +561,9 @@ class SAPB1Adaptor(object):
         sql = """SELECT top {0} {1} FROM dbo.ODLN""".format(num, cols)
         if len(params) > 0:
             sql = sql + ' WHERE ' + " AND ".join(["{0} {1} %({2})s".format(k, ops[k], k) for k in params.keys()])
-        self.adaptor.sqlSrvCursor.execute(sql, {key: params[key]['value'] for key in params.keys()})
+        self.cursorAdaptor.sqlSrvCursor.execute(sql, {key: params[key]['value'] for key in params.keys()})
         shipments = []
-        for row in self.adaptor.sqlSrvCursor:
+        for row in self.cursorAdaptor.sqlSrvCursor:
             shipment = {}
             for k, v in row.items():
                 value = ''

@@ -44,7 +44,7 @@ from setuptools import find_packages, setup
 
 setup(
     name='Flask-SAPB1',
-    version='0.0.1',
+    version='0.0.2',
     url='https://github.com/ideabosque/Flask-SAPB1',
     license='MIT',
     author='Idea Bosque',
@@ -56,7 +56,7 @@ setup(
     include_package_data=True,
     platforms='win32',
     install_requires=['Flask', 'pymssql', 'pywin32'],
-    download_url = 'https://github.com/ideabosque/Flask-SAPB1/tarball/0.0.1',
+    download_url = 'https://github.com/ideabosque/Flask-SAPB1/tarball/0.0.2',
     keywords = ['SAP B1', 'SAP Business One', 'DI'], # arbitrary keywords
     classifiers=[
         'License :: OSI Approved :: MIT License',
